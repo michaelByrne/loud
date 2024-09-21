@@ -1,39 +1,41 @@
 const std = @import("std");
-const fs = @import("fs");
+const fs = std.fs;
 const native_endian = @import("builtin").target.cpu.arch.endian();
 const testing = std.testing;
+const arenaAllocator = std.heap.ArenaAllocator;
+const pageAllocator = std.heap.ArenaAllocator;
 
 const GUID = struct {
-    data1: u32,
-    data2: u32,
-    data3: u32,
+    data1: c_int,
+    data2: c_short,
+    data3: c_short,
     data4: [8]u32,
 };
 
 const WAVEFORMATEXT = struct {
-    format_tag: u32,
-    num_channels: u32,
-    samples_per_sec: u64,
-    avg_bytes_per_sec: u64,
-    block_align: u32,
-    bits_per_sample: u32,
-    cb_size: u32,
+    format_tag: c_short,
+    num_channels: c_int,
+    samples_per_sec: c_int,
+    avg_bytes_per_sec: c_int,
+    block_align: c_int,
+    bits_per_sample: c_int,
+    cb_size: c_short,
 };
 
 const WAVEFORMATEXTENSIBLE = struct {
     format: WAVEFORMATEXT,
     samples: Samples,
-    channel_mask: u64,
+    channel_mask: c_int,
     sub_format: GUID,
 };
 
 const WAVEFORMAT = struct {
-    format_tag: u32,
-    num_channels: u32,
-    samples_per_sec: u64,
-    avg_bytes_per_sec: u64,
-    block_align: u32,
-    bits_per_sample: u32,
+    format_tag: c_short,
+    num_channels: c_short,
+    samples_per_sec: c_int,
+    avg_bytes_per_sec: c_int,
+    block_align: c_short,
+    bits_per_sample: c_short,
 };
 
 const ChPeak = struct {
@@ -51,26 +53,34 @@ const KSDATAFORMAT_SUBTYPE_PCM = GUID{
 const FilePos = c_ulonglong;
 const Time = c_ulong;
 
-const LastOp = enum { read, write };
-const PSFFormat = enum { unknown, wav, wavex };
-const PSFSType = enum { samp_unknown, samp_8, samp_16, samp_24, samp_32, samp_ieee_float };
-const PSFChannelFormat = enum { std_wave };
+const LastOp = enum(u8) { read, write };
+const PSFFormat = enum(u8) { unknown, wav, wavex };
+const PSFSType = enum(u8) { samp_unknown, samp_8, samp_16, samp_24, samp_32, samp_ieee_float };
+const PSFChannelFormat = enum(u8) { std_wave, mc_std };
 const Samples = union {
-    valid_bits_per_sample: u32,
-    samples_per_block: u32,
-    reserved: u32,
+    valid_bits_per_sample: c_ushort,
+    samples_per_block: c_ushort,
+    reserved: c_ushort,
 };
 
 const SizeError = error{TypeNotFound};
+const NewFileError = error{
+    InvalidFormat,
+    InvalidChannels,
+    InvalidChannelFormat,
+    InvalidRate,
+    InvalidSampleType,
+};
 
 const PSFMaxFiles = 64;
+const WAVE_FORMAT_PCM = 0x0001;
 
 const PSFFile = struct {
-    file: *fs.File,
+    file: ?*fs.File,
     file_name: []u32,
-    curr_frame_pos: u64,
-    num_frames: u64,
-    is_little_endian: u8,
+    curr_frame_pos: c_long,
+    num_frames: c_long,
+    is_little_endian: c_int,
     is_read: bool,
     clip_floats: bool,
     rescale: bool,
@@ -81,11 +91,19 @@ const PSFFile = struct {
     fmt_offset: FilePos,
     fmt: WAVEFORMATEXTENSIBLE,
     channel_format: PSFChannelFormat,
-    peak: *ChPeak,
+    peak: ?*ChPeak,
     peak_time: Time,
     last_write_pos: FilePos,
     last_op: LastOp,
-    dither_type: u8,
+    dither_type: c_int,
+};
+
+const PSFProps = struct {
+    s_rate: c_int,
+    chans: c_int,
+    s_type: PSFSType,
+    format: PSFFormat,
+    channel_format: PSFChannelFormat,
 };
 
 const PSFFiles = *[PSFMaxFiles]PSFFile;
@@ -134,7 +152,7 @@ pub fn byteOrder() u8 {
     return 0;
 }
 
-pub fn bitSize(s_type: PSFSType) !u4 {
+pub fn bitSize(s_type: PSFSType) !c_int {
     switch (s_type) {
         PSFSType.samp_24 => return 24,
         PSFSType.samp_16 => return 16,
@@ -143,7 +161,7 @@ pub fn bitSize(s_type: PSFSType) !u4 {
     }
 }
 
-pub fn wordSize(s_type: PSFSType) !u4 {
+pub fn wordSize(s_type: PSFSType) !c_int {
     switch (s_type) {
         PSFSType.samp_24 => return 2,
         PSFSType.samp_16 => return 3,
@@ -193,10 +211,115 @@ pub fn checkGUID(sf_dat: *PSFFile) bool {
     return false;
 }
 
+// NEW FILE
+
+pub fn newFile(props: ?PSFProps, allocator: *std.mem.Allocator) !*PSFFile {
+    if (props != null) {
+        if (props.?.chans <= 0) {
+            return NewFileError.InvalidChannels;
+        }
+        if (props.?.s_rate <= 0) {
+            return NewFileError.InvalidRate;
+        }
+        if (@intFromEnum(props.?.s_type) < @intFromEnum(PSFSType.samp_16)) {
+            return NewFileError.InvalidSampleType;
+        }
+        if (@intFromEnum(props.?.s_type) > @intFromEnum(PSFSType.samp_ieee_float)) {
+            return NewFileError.InvalidSampleType;
+        }
+        if (@intFromEnum(props.?.format) <= @intFromEnum(PSFFormat.unknown)) {
+            return NewFileError.InvalidFormat;
+        }
+        if (@intFromEnum(props.?.format) > @intFromEnum(PSFFormat.wavex)) {
+            return NewFileError.InvalidFormat;
+        }
+        if (props.?.channel_format != PSFChannelFormat.std_wave) {
+            return NewFileError.InvalidChannelFormat;
+        }
+    }
+
+    const psfFile: *PSFFile = try allocator.create(PSFFile);
+
+    psfFile.last_write_pos = 0;
+    psfFile.file = null;
+    psfFile.file_name = &[_]u32{};
+    psfFile.num_frames = 0;
+    psfFile.curr_frame_pos = 0;
+    psfFile.is_read = true;
+
+    if (props != null) {
+        psfFile.riff_format = props.?.format;
+    } else {
+        psfFile.riff_format = PSFFormat.wav;
+    }
+
+    psfFile.clip_floats = true;
+    psfFile.rescale = false;
+    psfFile.rescale_fact = 1.0;
+    psfFile.is_little_endian = byteOrder();
+
+    if (props != null) {
+        psfFile.samp_type = props.?.s_type;
+    } else {
+        psfFile.samp_type = PSFSType.samp_16;
+    }
+
+    psfFile.data_offset = 0;
+    psfFile.peak_time = 0;
+    psfFile.fmt_offset = 0;
+    psfFile.fmt.format.format_tag = WAVE_FORMAT_PCM;
+
+    if (props != null) {
+        psfFile.fmt.format.num_channels = props.?.chans;
+        psfFile.fmt.format.samples_per_sec = props.?.s_rate;
+
+        const sampleTypeSize = try wordSize(props.?.s_type);
+        psfFile.fmt.format.block_align = psfFile.fmt.format.num_channels * sampleTypeSize;
+        psfFile.fmt.format.bits_per_sample = try bitSize(props.?.s_type);
+    } else {
+        psfFile.fmt.format.num_channels = 1;
+        psfFile.fmt.format.samples_per_sec = 44100;
+        psfFile.fmt.format.block_align = psfFile.fmt.format.num_channels * @sizeOf(c_short);
+        psfFile.fmt.format.bits_per_sample = @sizeOf(c_short) * 8;
+    }
+
+    psfFile.peak = null;
+    psfFile.peak_time = 0;
+    psfFile.fmt.format.cb_size = 0;
+    psfFile.fmt.channel_mask = 0;
+
+    if (props != null) {
+        if (props.?.format == PSFFormat.wavex) {
+            psfFile.fmt.format.cb_size = 22;
+
+            if (psfFile.channel_format == PSFChannelFormat.std_wave) {
+                psfFile.channel_format = PSFChannelFormat.mc_std;
+            }
+
+            switch (psfFile.channel_format) {
+                else => {
+                    psfFile.fmt.channel_mask = 0;
+                },
+            }
+        }
+    }
+
+    psfFile.dither_type = 0;
+
+    return psfFile;
+}
+
 pub fn main() !void {
     std.debug.print("All your {s} are belong to us.\n", .{"sounds"});
 
-    std.debug.print("endianness: {}\n", .{byteOrder()});
+    var arena = arenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var allocator = arena.allocator();
+
+    _ = try newFile(null, &allocator);
+
+    return;
 }
 
 test "GUID comparison" {
